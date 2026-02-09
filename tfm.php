@@ -671,7 +671,17 @@ final class FsService
         private readonly string $baseDir,
         private readonly array $protectedBasenames,
     ) {
+        $baseReal = realpath($this->baseDir);
+        if ($baseReal === false || !is_dir($baseReal)) {
+            throw new AppException('Invalid base dir', httpStatus: 500, publicMessage: 'Server is not ready.');
+        }
+
+        $this->baseDirReal = rtrim($baseReal, DIRECTORY_SEPARATOR);
+        $this->allowedRoot = $this->filesystemRoot($this->baseDirReal);
     }
+
+    private readonly string $baseDirReal;
+    private readonly string $allowedRoot;
 
     /** @return array<int, array{name:string,type:string,size:int|null,mtime:int,mtime_iso:string|null}> */
     public function listDir(string $relDir): array
@@ -751,6 +761,21 @@ final class FsService
         );
 
         return $out;
+    }
+
+    public function canonicalDir(string $relDir): string
+    {
+        $abs = $this->resolveExistingDir($relDir);
+        return $this->absToRelFromBase($abs);
+    }
+
+    public function rootRel(): string
+    {
+        $root = realpath($this->allowedRoot);
+        if ($root === false || !is_dir($root)) {
+            $root = $this->allowedRoot;
+        }
+        return $this->absToRelFromBase($root);
     }
 
     /** @return array{saved_as:string, bytes:int} */
@@ -985,7 +1010,7 @@ final class FsService
     private function resolveExistingDir(string $relDir): string
     {
         $rel = $this->normalizeRel($relDir);
-        $abs = $this->baseDir . ($rel === '' ? '' : DIRECTORY_SEPARATOR . $rel);
+        $abs = $this->baseDirReal . ($rel === '' ? '' : DIRECTORY_SEPARATOR . $rel);
 
         $real = realpath($abs);
         if ($real === false || !is_dir($real)) {
@@ -1005,7 +1030,7 @@ final class FsService
             throw new AppException('Empty path', httpStatus: 400, publicMessage: 'Invalid path.');
         }
 
-        $abs = $this->baseDir . DIRECTORY_SEPARATOR . $relNorm;
+        $abs = $this->baseDirReal . DIRECTORY_SEPARATOR . $relNorm;
         $real = realpath($abs);
         if ($real === false || !file_exists($real)) {
             throw new AppException('Path not found', httpStatus: 404, publicMessage: 'Not found.');
@@ -1033,7 +1058,7 @@ final class FsService
             throw new AppException('Empty target path', httpStatus: 400, publicMessage: 'Invalid target path.');
         }
 
-        $abs = $this->baseDir . DIRECTORY_SEPARATOR . $relNorm;
+        $abs = $this->baseDirReal . DIRECTORY_SEPARATOR . $relNorm;
         $parent = dirname($abs);
         $parentReal = realpath($parent);
         if ($parentReal === false || !is_dir($parentReal)) {
@@ -1247,13 +1272,19 @@ final class FsService
 
     private function assertWithinBase(string $abs): void
     {
-        $base = rtrim((string)realpath($this->baseDir), DIRECTORY_SEPARATOR);
-        if ($base === '') {
-            throw new AppException('Invalid base dir', httpStatus: 500, publicMessage: 'Server is not ready.');
+        $base = (string)(realpath($this->allowedRoot) ?: $this->allowedRoot);
+        if ($base === '' || !is_dir($base)) {
+            throw new AppException('Invalid allowed root', httpStatus: 500, publicMessage: 'Server is not ready.');
         }
 
-        $candidate = str_replace('\\', '/', $abs);
-        $baseN = str_replace('\\', '/', $base);
+        $candidate = rtrim(str_replace('\\', '/', $abs), '/');
+        $baseN = rtrim(str_replace('\\', '/', $base), '/');
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $candidate = strtolower($candidate);
+            $baseN = strtolower($baseN);
+        }
+
         if (!str_starts_with($candidate . '/', $baseN . '/')) {
             throw new AppException('Path confinement violation', httpStatus: 403, publicMessage: 'Path is not allowed.');
         }
@@ -1261,13 +1292,22 @@ final class FsService
 
     private function assertNoSymlinkPath(string $absExisting): void
     {
-        $base = rtrim((string)realpath($this->baseDir), DIRECTORY_SEPARATOR);
-        $base = $base === '' ? $this->baseDir : $base;
-        $base = rtrim($base, DIRECTORY_SEPARATOR);
+        $base = (string)(realpath($this->allowedRoot) ?: $this->allowedRoot);
+        if ($base === '' || !is_dir($base)) {
+            return;
+        }
 
-        $baseN = str_replace('\\', '/', $base);
-        $absN = str_replace('\\', '/', $absExisting);
-        if (!str_starts_with($absN, $baseN)) {
+        $baseN = rtrim(str_replace('\\', '/', $base), '/');
+        $absN = rtrim(str_replace('\\', '/', $absExisting), '/');
+
+        $cmpBaseN = $baseN;
+        $cmpAbsN = $absN;
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $cmpBaseN = strtolower($cmpBaseN);
+            $cmpAbsN = strtolower($cmpAbsN);
+        }
+
+        if (!str_starts_with($cmpAbsN . '/', $cmpBaseN . '/')) {
             return;
         }
 
@@ -1277,7 +1317,7 @@ final class FsService
         }
 
         $parts = array_values(array_filter(explode('/', $rel), static fn (string $p): bool => $p !== ''));
-        $cursor = $base;
+        $cursor = rtrim($base, DIRECTORY_SEPARATOR);
         foreach ($parts as $p) {
             $cursor .= DIRECTORY_SEPARATOR . $p;
             if (file_exists($cursor) && is_link($cursor)) {
@@ -1313,12 +1353,117 @@ final class FsService
                 continue;
             }
             if ($p === '..') {
-                throw new AppException('Traversal blocked', httpStatus: 403, publicMessage: 'Path is not allowed.');
+                $last = $clean[count($clean) - 1] ?? null;
+                if (is_string($last) && $last !== '..') {
+                    array_pop($clean);
+                    continue;
+                }
+                $clean[] = '..';
+                continue;
             }
             $clean[] = $p;
         }
 
         return implode(DIRECTORY_SEPARATOR, $clean);
+    }
+
+    private function filesystemRoot(string $baseAbs): string
+    {
+        $path = str_replace('/', DIRECTORY_SEPARATOR, $baseAbs);
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            if (preg_match('/^\\\\\\\\([^\\\\]+)\\\\([^\\\\]+)/', $path, $m) === 1) {
+                return '\\\\' . $m[1] . '\\' . $m[2] . '\\';
+            }
+            if (preg_match('/^([A-Za-z]):\\\\/', $path, $m) === 1) {
+                return strtoupper($m[1]) . ':\\';
+            }
+
+            $cursor = rtrim($path, DIRECTORY_SEPARATOR);
+            while (true) {
+                $parent = dirname($cursor);
+                if ($parent === $cursor) {
+                    return rtrim($cursor, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+                }
+                $cursor = $parent;
+            }
+        }
+
+        return DIRECTORY_SEPARATOR;
+    }
+
+    private function absToRelFromBase(string $abs): string
+    {
+        $base = $this->baseDirReal;
+        $baseInfo = $this->splitAbs($base);
+        $absInfo = $this->splitAbs($abs);
+
+        if (($baseInfo['prefix'] ?? '') !== ($absInfo['prefix'] ?? '')) {
+            throw new AppException('Path root mismatch', httpStatus: 403, publicMessage: 'Path is not allowed.');
+        }
+
+        /** @var array<int, string> $bParts */
+        $bParts = $baseInfo['parts'] ?? [];
+        /** @var array<int, string> $aParts */
+        $aParts = $absInfo['parts'] ?? [];
+
+        $common = 0;
+        $max = min(count($bParts), count($aParts));
+        for ($i = 0; $i < $max; $i++) {
+            $b = $bParts[$i];
+            $a = $aParts[$i];
+            if (DIRECTORY_SEPARATOR === '\\') {
+                if (strcasecmp($b, $a) !== 0) {
+                    break;
+                }
+            } else {
+                if ($b !== $a) {
+                    break;
+                }
+            }
+            $common++;
+        }
+
+        $up = count($bParts) - $common;
+        $down = array_slice($aParts, $common);
+
+        $relParts = [];
+        for ($i = 0; $i < $up; $i++) {
+            $relParts[] = '..';
+        }
+        foreach ($down as $p) {
+            if ($p !== '') {
+                $relParts[] = $p;
+            }
+        }
+
+        return implode('/', $relParts);
+    }
+
+    /** @return array{prefix:string,parts:array<int,string>} */
+    private function splitAbs(string $abs): array
+    {
+        $p = str_replace('\\', '/', $abs);
+        $p = rtrim($p, '/');
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            if (preg_match('#^//([^/]+)/([^/]+)(/.*)?$#', $p, $m) === 1) {
+                $prefix = '//' . strtolower($m[1]) . '/' . strtolower($m[2]);
+                $rest = $m[3] ?? '';
+                $parts = $rest === '' ? [] : explode('/', trim($rest, '/'));
+                return ['prefix' => $prefix, 'parts' => array_values(array_filter($parts, static fn (string $v): bool => $v !== ''))];
+            }
+
+            if (preg_match('#^([A-Za-z]):(?:/(.*))?$#', $p, $m) === 1) {
+                $prefix = strtolower($m[1]) . ':';
+                $rest = $m[2] ?? '';
+                $parts = $rest === '' ? [] : explode('/', trim($rest, '/'));
+                return ['prefix' => $prefix, 'parts' => array_values(array_filter($parts, static fn (string $v): bool => $v !== ''))];
+            }
+        }
+
+        $parts = $p === '' ? [] : explode('/', trim($p, '/'));
+        return ['prefix' => '', 'parts' => array_values(array_filter($parts, static fn (string $v): bool => $v !== ''))];
     }
 
     private function sanitizeBasename(string $name): string
@@ -1570,12 +1715,12 @@ final class Actions
     #[RequiresAuth]
     public function list(): array
     {
-        $dir = $this->readQueryString('dir', maxLen: 2048, allowEmpty: true);
+        $dirRaw = $this->readQueryString('dir', maxLen: 2048, allowEmpty: true);
         return [
             'ok' => true,
             'data' => [
-                'dir' => $dir,
-                'entries' => $this->fs->listDir($dir),
+                'dir' => $this->fs->canonicalDir($dirRaw),
+                'entries' => $this->fs->listDir($dirRaw),
             ],
         ];
     }
@@ -2171,9 +2316,11 @@ final class App
     private function js(string $csrf): string
     {
         $csrfJs = json_encode($csrf, flags: JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $rootRelJs = json_encode($this->fs->rootRel(), flags: JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         return <<<JS
         (function(){
           const CSRF = {$csrfJs} || '';
+          const ROOT_REL = {$rootRelJs} || '';
           const byId = (id) => document.getElementById(id);
           const toastHost = byId('toastHost');
           const modal = byId('modal');
@@ -2281,7 +2428,21 @@ final class App
 
           function normalizeDir(dir) {
             // PHP heredoc parses backslash escapes: use \\\\ here to emit \\ in JS and match "\" correctly.
-            return String(dir||'').replace(/\\\\/g,'/').replace(/^\/+/, '').replace(/\/+$/,'');
+            const raw = String(dir||'').replace(/\\\\/g,'/').replace(/^\/+/, '').replace(/\/+$/,'');
+            if(!raw) return '';
+            const parts = raw.split('/').filter(Boolean);
+            const clean = [];
+            for(const p of parts){
+              if(p === '.' || p === '') continue;
+              if(p === '..'){
+                const last = clean.length ? clean[clean.length-1] : '';
+                if(last && last !== '..'){ clean.pop(); }
+                else clean.push('..');
+                continue;
+              }
+              clean.push(p);
+            }
+            return clean.join('/');
           }
 
           let currentDir = '';
@@ -2320,10 +2481,14 @@ final class App
             return dir.replace(/\/+$/,'') + '/' + name;
           }
           function parentDir(dir){
-            const d = (dir||'').replace(/\/+$/,'');
-            const idx = d.lastIndexOf('/');
-            if(idx <= -1) return '';
-            return d.slice(0, idx);
+            const d = normalizeDir(dir);
+            if(d === ROOT_REL){
+              return d;
+            }
+            if(!d){
+              return '..';
+            }
+            return normalizeDir(d + '/..');
           }
 
           function renderCrumbs(){
@@ -2405,6 +2570,13 @@ final class App
               const msg = (json && json.error) ? json.error : 'Cannot load folder.';
               return { ok:false, canceled:false, error:msg };
             }
+            const serverDir = (json.data && typeof json.data.dir === 'string') ? normalizeDir(json.data.dir) : currentDir;
+            if(serverDir !== currentDir){
+              currentDir = serverDir;
+              if(pathText) pathText.textContent = currentDir ? ('/' + currentDir) : '/';
+              renderCrumbs();
+            }
+            if(btnUp) btnUp.disabled = (currentDir === ROOT_REL);
             const entries = (json.data && json.data.entries) ? json.data.entries : [];
             if(seq !== loadSeq) return { ok:false, canceled:true };
             if(!entries.length){
@@ -2688,7 +2860,15 @@ final class App
             });
           }
 
-          if(btnUp){ btnUp.addEventListener('click', () => navigate(parentDir(currentDir))); }
+          if(btnUp){
+            btnUp.addEventListener('click', () => {
+              if(currentDir === ROOT_REL){
+                toast('err','Error','Already at filesystem root.');
+                return;
+              }
+              navigate(parentDir(currentDir));
+            });
+          }
           if(btnRefresh){
             btnRefresh.addEventListener('click', async () => {
               const loadRes = await load();
