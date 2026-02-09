@@ -1,0 +1,160 @@
+# =========================
+# OS-generated files
+# =========================
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Icon?
+.Spotlight-V100
+.Trashes
+desktop.ini
+._*
+
+# =========================
+# Editor / IDE settings
+# =========================
+.trae/
+.vscode/
+.idea/
+.vs/
+.history/
+.cache/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+note.dat
+
+# =========================
+# Logs / runtime / temp
+# =========================
+logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+tmp/
+.tmp/
+
+# =========================
+# Dependency directories
+# =========================
+node_modules/
+bower_components/
+vendor/
+vendor/bundle/
+.bundle/
+
+# =========================
+# Build outputs / artifacts
+# =========================
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+storybook-static/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.class
+*.jar
+*.war
+*.ear
+
+# =========================
+# JavaScript / Node.js
+# =========================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.yarn/
+.pnp*
+.next/
+.nuxt/
+.turbo/
+/.eslintcache
+/.parcel-cache
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# =========================
+# Java / Gradle / Maven
+# =========================
+target/
+.gradle/
+build/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+.classpath
+.project
+.settings/
+
+# =========================
+# Go
+# =========================
+bin/
+pkg/
+*.test
+
+# =========================
+# Ruby / Rails
+# =========================
+log/
+tmp/
+.rspec
+.bundle/
+vendor/bundle/
+
+# =========================
+# PHP / Composer / PHPUnit
+# =========================
+/.phpunit.result.cache
+/.phpunit.cache/
+
+# =========================
+# Container / Terraform (optional)
+# =========================
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# =========================
+# Trae IDE / project tooling
+# =========================
+.trae/
