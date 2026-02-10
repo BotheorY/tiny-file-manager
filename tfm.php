@@ -233,7 +233,7 @@ if (DEBUG_MODE) {
  * Custom Exception for Application Errors.
  * These exceptions are safe to display to the user (publicMessage).
  */
-final class AppException extends RuntimeException
+class AppException extends RuntimeException
 {
     public function __construct(
         string $message,
@@ -241,6 +241,36 @@ final class AppException extends RuntimeException
         public readonly ?string $publicMessage = null
     ) {
         parent::__construct($message);
+    }
+}
+
+final class ZipErrorCode
+{
+    public const UNAVAILABLE = 1000;
+    public const OPEN_FAILED = 1001;
+    public const INVALID_ZIP = 1002;
+    public const CORRUPT = 1003;
+    public const PASSWORD_REQUIRED = 1004;
+    public const WRONG_PASSWORD = 1005;
+    public const TRAVERSAL = 1006;
+    public const DEST_NOT_WRITABLE = 1007;
+    public const DEST_EXISTS = 1008;
+    public const IO = 1009;
+    public const LOCK_TIMEOUT = 1010;
+    public const TOO_LARGE = 1011;
+    public const TIMEOUT = 1012;
+}
+
+final class ZipOpException extends AppException
+{
+    public function __construct(
+        string $message,
+        int $httpStatus,
+        ?string $publicMessage,
+        public readonly int $errorCode,
+        public readonly ?string $detail = null,
+    ) {
+        parent::__construct($message, httpStatus: $httpStatus, publicMessage: $publicMessage);
     }
 }
 
@@ -665,6 +695,7 @@ final class FsService
 {
     private const NAME_MAX_BYTES = 255;
     private const PATH_MAX_BYTES = 4096;
+    private const ZIP_MAX_SECONDS = 1800;
 
     /** @param array<int, string> $protectedBasenames */
     public function __construct(
@@ -1679,6 +1710,971 @@ final class FsService
         $p = rtrim(str_replace('\\', '/', $parentAbs), '/');
         return str_starts_with($c . '/', $p . '/');
     }
+
+    /** @return array{progress_id:string,zip:string,entries:int,bytes:int,skipped_symlinks:int} */
+    public function zipCreate(string $srcRel, string $dstRel, string $level, ?string $progressId = null): array
+    {
+        if (!class_exists(ZipArchive::class)) {
+            throw new ZipOpException('ZipArchive missing', 500, 'ZIP support is not available on this server.', ZipErrorCode::UNAVAILABLE);
+        }
+
+        $startedAt = microtime(true);
+        $srcAbs = $this->resolveExistingPath($srcRel);
+        $isDir = is_dir($srcAbs);
+        $isFile = is_file($srcAbs);
+        if (!$isDir && !$isFile) {
+            throw new ZipOpException('Source not file/dir', 400, 'Not found.', ZipErrorCode::IO);
+        }
+
+        $progressId = $this->zipNormalizeProgressId($progressId);
+        $progressPath = $this->zipProgressPath($progressId);
+        $this->zipWriteProgress($progressPath, [
+            'state' => 'running',
+            'op' => 'create',
+            'processed' => 0,
+            'total' => 0,
+            'bytes' => 0,
+            'message' => 'Starting…',
+            'updated_at' => time(),
+        ]);
+
+        $levelFlag = match (strtolower(trim($level))) {
+            'fast' => 1,
+            'maximum', 'max' => 9,
+            default => 6,
+        };
+
+        $srcRelNorm = $this->normalizeRel($srcRel);
+        $zipRoot = $this->relToZipPath($srcRelNorm);
+
+        if (trim($dstRel) === '') {
+            $srcDirRel = $this->absToRelFromBase(dirname($srcAbs));
+            $zipName = basename($srcAbs) . '.zip';
+            $dstRel = ($srcDirRel !== '' ? ($srcDirRel . '/' . $zipName) : $zipName);
+        }
+
+        $dstRelNorm = $this->normalizeRel($dstRel);
+        if (!str_ends_with(strtolower($dstRelNorm), '.zip')) {
+            $dstRelNorm .= '.zip';
+        }
+
+        $dstInfo = $this->resolveTargetForWrite($dstRelNorm);
+        $dstAbs = $dstInfo['abs'];
+
+        $lockHandles = $this->zipAcquireLocks([$dstAbs], waitMs: 8000);
+        try {
+            $total = 0;
+            $bytesTotal = 0;
+            $skippedLinks = 0;
+
+            if ($isFile) {
+                $total = 1;
+                try {
+                    $bytesTotal = (int)filesize($srcAbs);
+                } catch (Throwable) {
+                    $bytesTotal = 0;
+                }
+            } else {
+                $total = 1;
+                $it = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_FILEINFO),
+                    RecursiveIteratorIterator::SELF_FIRST,
+                );
+                foreach ($it as $info) {
+                    $this->zipExtendTimeLimit();
+                    $this->zipCheckTimeout($startedAt);
+                    if (!$info instanceof SplFileInfo) {
+                        continue;
+                    }
+                    if ($info->isLink()) {
+                        $skippedLinks++;
+                        continue;
+                    }
+                    if ($info->isDir()) {
+                        $total++;
+                        continue;
+                    }
+                    if ($info->isFile()) {
+                        $total++;
+                        $bytesTotal += (int)$info->getSize();
+                        continue;
+                    }
+                }
+            }
+
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'running',
+                'op' => 'create',
+                'processed' => 0,
+                'total' => $total,
+                'bytes' => 0,
+                'message' => 'Preparing…',
+                'updated_at' => time(),
+            ]);
+
+            $zip = new ZipArchive();
+            $openResult = $zip->open($dstAbs, ZipArchive::CREATE | ZipArchive::EXCL);
+            if ($openResult !== true) {
+                $detail = $this->zipOpenErrorDetail($openResult);
+                throw new ZipOpException('Zip open failed: ' . (string)$openResult, 500, 'Cannot create ZIP archive.', ZipErrorCode::OPEN_FAILED, $detail);
+            }
+
+            $processed = 0;
+            $bytesProcessed = 0;
+            try {
+                if ($isFile) {
+                    $this->zipExtendTimeLimit();
+                    $this->zipCheckTimeout($startedAt);
+                    if (!$zip->addFile($srcAbs, $zipRoot)) {
+                        throw new ZipOpException('addFile failed', 500, 'Failed to add file to ZIP.', ZipErrorCode::IO);
+                    }
+                    if (method_exists($zip, 'setCompressionName')) {
+                        $zip->setCompressionName($zipRoot, ZipArchive::CM_DEFLATE, $levelFlag);
+                    }
+                    $processed = 1;
+                    $bytesProcessed = $bytesTotal;
+                    $this->zipWriteProgress($progressPath, [
+                        'state' => 'running',
+                        'op' => 'create',
+                        'processed' => $processed,
+                        'total' => $total,
+                        'bytes' => $bytesProcessed,
+                        'message' => 'Adding file…',
+                        'updated_at' => time(),
+                    ]);
+                } else {
+                    $zip->addEmptyDir($zipRoot . '/');
+                    $processed++;
+
+                    $it = new RecursiveIteratorIterator(
+                        new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_FILEINFO),
+                        RecursiveIteratorIterator::SELF_FIRST,
+                    );
+
+                    $tick = 0;
+                    foreach ($it as $info) {
+                        $this->zipExtendTimeLimit();
+                        $this->zipCheckTimeout($startedAt);
+                        if (!$info instanceof SplFileInfo) {
+                            continue;
+                        }
+                        if ($info->isLink()) {
+                            $skippedLinks++;
+                            continue;
+                        }
+
+                        $path = $info->getPathname();
+                        if (!is_string($path) || $path === '') {
+                            continue;
+                        }
+
+                        $relWithin = substr($path, strlen($srcAbs));
+                        $relWithin = ltrim(str_replace('\\', '/', $relWithin), '/');
+                        $local = $zipRoot . ($relWithin !== '' ? ('/' . $relWithin) : '');
+
+                        if ($info->isDir()) {
+                            $zip->addEmptyDir(rtrim($local, '/') . '/');
+                            $processed++;
+                        } elseif ($info->isFile()) {
+                            if (!$zip->addFile($path, $local)) {
+                                throw new ZipOpException('addFile failed', 500, 'Failed to add file to ZIP.', ZipErrorCode::IO, $local);
+                            }
+                            if (method_exists($zip, 'setCompressionName')) {
+                                $zip->setCompressionName($local, ZipArchive::CM_DEFLATE, $levelFlag);
+                            }
+                            $processed++;
+                            $bytesProcessed += (int)$info->getSize();
+                        } else {
+                            continue;
+                        }
+
+                        $tick++;
+                        if ($tick % 50 === 0) {
+                            $this->zipWriteProgress($progressPath, [
+                                'state' => 'running',
+                                'op' => 'create',
+                                'processed' => $processed,
+                                'total' => $total,
+                                'bytes' => $bytesProcessed,
+                                'message' => 'Compressing…',
+                                'updated_at' => time(),
+                            ]);
+                        }
+                    }
+
+                    $this->zipWriteProgress($progressPath, [
+                        'state' => 'running',
+                        'op' => 'create',
+                        'processed' => $processed,
+                        'total' => $total,
+                        'bytes' => $bytesProcessed,
+                        'message' => 'Finalizing…',
+                        'updated_at' => time(),
+                    ]);
+                }
+            } finally {
+                $zip->close();
+            }
+
+            $zipRel = $this->absToRelFromBase($dstAbs);
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'done',
+                'op' => 'create',
+                'processed' => $total,
+                'total' => $total,
+                'bytes' => $bytesTotal,
+                'message' => 'Done.',
+                'result' => ['zip' => $zipRel],
+                'updated_at' => time(),
+            ]);
+
+            return [
+                'progress_id' => $progressId,
+                'zip' => $zipRel,
+                'entries' => $total,
+                'bytes' => $bytesTotal,
+                'skipped_symlinks' => $skippedLinks,
+            ];
+        } catch (ZipOpException $e) {
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'error',
+                'op' => 'create',
+                'message' => $e->publicMessage ?? 'ZIP operation failed.',
+                'error_code' => $e->errorCode,
+                'detail' => $e->detail,
+                'updated_at' => time(),
+            ]);
+            @unlink($dstAbs);
+            throw $e;
+        } catch (Throwable $e) {
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'error',
+                'op' => 'create',
+                'message' => 'ZIP operation failed.',
+                'updated_at' => time(),
+            ]);
+            @unlink($dstAbs);
+            throw $e;
+        } finally {
+            $this->zipReleaseLocks($lockHandles);
+        }
+    }
+
+    /** @return array{progress_id:string,extracted_to:string,files:int,dirs:int,nested_zips:int} */
+    public function zipExtract(string $zipRel, string $destDirRel, string $password, bool $recursive, ?string $progressId = null): array
+    {
+        if (!class_exists(ZipArchive::class)) {
+            throw new ZipOpException('ZipArchive missing', 500, 'ZIP support is not available on this server.', ZipErrorCode::UNAVAILABLE);
+        }
+
+        $startedAt = microtime(true);
+        $zipAbs = $this->resolveExistingPath($zipRel);
+        if (!is_file($zipAbs)) {
+            throw new ZipOpException('Not a file', 400, 'Not a file.', ZipErrorCode::IO);
+        }
+
+        if (!is_readable($zipAbs)) {
+            throw new ZipOpException('ZIP not readable', 403, 'ZIP file is not readable.', ZipErrorCode::IO);
+        }
+
+        $zipExt = strtolower(pathinfo($zipAbs, PATHINFO_EXTENSION));
+        if ($zipExt !== 'zip') {
+            throw new ZipOpException('Not a zip', 400, 'Only .zip files can be extracted.', ZipErrorCode::INVALID_ZIP);
+        }
+
+        $destAbs = null;
+        if (trim($destDirRel) === '') {
+            $destAbs = realpath(dirname($zipAbs));
+            if ($destAbs === false || !is_dir($destAbs)) {
+                throw new ZipOpException('ZIP parent missing', 500, 'Destination folder is not available.', ZipErrorCode::IO);
+            }
+            $this->assertWithinBase($destAbs);
+            $this->assertNoSymlinkPath($destAbs);
+        } else {
+            $destAbs = $this->resolveExistingDir($destDirRel);
+        }
+
+        if (!is_writable($destAbs)) {
+            throw new ZipOpException('Destination not writable', 403, 'Destination folder is not writable.', ZipErrorCode::DEST_NOT_WRITABLE);
+        }
+
+        $progressId = $this->zipNormalizeProgressId($progressId);
+        $progressPath = $this->zipProgressPath($progressId);
+        $this->zipWriteProgress($progressPath, [
+            'state' => 'running',
+            'op' => 'extract',
+            'processed' => 0,
+            'total' => 0,
+            'bytes' => 0,
+            'message' => 'Starting…',
+            'updated_at' => time(),
+        ]);
+
+        $lockHandles = $this->zipAcquireLocks([$zipAbs, $destAbs], waitMs: 12000);
+        try {
+            $zip = new ZipArchive();
+            $openResult = $zip->open($zipAbs);
+            if ($openResult !== true) {
+                $detail = $this->zipOpenErrorDetail($openResult);
+                throw new ZipOpException('Zip open failed: ' . (string)$openResult, 400, 'Cannot open ZIP file.', ZipErrorCode::OPEN_FAILED, $detail);
+            }
+
+            if ($password !== '') {
+                $zip->setPassword($password);
+            }
+
+            $numFiles = $zip->numFiles;
+            if (!is_int($numFiles) || $numFiles < 0) {
+                $zip->close();
+                throw new ZipOpException('Invalid numFiles', 400, 'Invalid ZIP file.', ZipErrorCode::INVALID_ZIP);
+            }
+
+            $entryMap = [];
+            for ($i = 0; $i < $numFiles; $i++) {
+                $this->zipExtendTimeLimit();
+                $this->zipCheckTimeout($startedAt);
+                $stat = $zip->statIndex($i, ZipArchive::FL_UNCHANGED);
+                if (!is_array($stat)) {
+                    $zip->close();
+                    throw new ZipOpException('statIndex failed', 400, 'Corrupted or incomplete ZIP file.', ZipErrorCode::CORRUPT);
+                }
+                $name = $stat['name'] ?? null;
+                if (!is_string($name) || $name === '') {
+                    $zip->close();
+                    throw new ZipOpException('Invalid entry name', 400, 'Invalid ZIP file.', ZipErrorCode::INVALID_ZIP);
+                }
+                $norm = $this->zipNormalizeEntryName($name);
+                $entryMap[] = ['zip_name' => $name, 'path' => $norm['path'], 'is_dir' => $norm['is_dir'], 'mtime' => (int)($stat['mtime'] ?? 0)];
+            }
+
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'running',
+                'op' => 'extract',
+                'processed' => 0,
+                'total' => $numFiles,
+                'bytes' => 0,
+                'message' => 'Validating…',
+                'updated_at' => time(),
+            ]);
+
+            $files = 0;
+            $dirs = 0;
+            $nested = 0;
+            $bytes = 0;
+            $zipCandidates = [];
+
+            try {
+                $tick = 0;
+                foreach ($entryMap as $idx => $entry) {
+                    $this->zipExtendTimeLimit();
+                    $this->zipCheckTimeout($startedAt);
+                    $zipName = $entry['zip_name'];
+                    $relPath = $entry['path'];
+                    $isDir = $entry['is_dir'];
+                    $mtime = (int)($entry['mtime'] ?? 0);
+                    $targetAbs = $destAbs . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relPath);
+                    $this->assertWithinBase($targetAbs);
+
+                    $perms = $this->zipEntryPerms($zip, $idx, $isDir);
+
+                    if ($isDir) {
+                        if (!is_dir($targetAbs)) {
+                            try {
+                                if (!mkdir($targetAbs, $perms ?? 0750, true)) {
+                                    throw new ZipOpException('mkdir failed', 403, 'Cannot create destination folder.', ZipErrorCode::IO, $relPath);
+                                }
+                            } catch (ErrorException $e) {
+                                throw new ZipOpException('mkdir failed: ' . $e->getMessage(), 403, 'Cannot create destination folder.', ZipErrorCode::IO, $relPath);
+                            }
+                        }
+                        if ($perms !== null) {
+                            try {
+                                chmod($targetAbs, $perms);
+                            } catch (Throwable) {
+                            }
+                        }
+                        if ($mtime > 0) {
+                            try {
+                                touch($targetAbs, $mtime);
+                            } catch (Throwable) {
+                            }
+                        }
+                        $dirs++;
+                    } else {
+                        $parent = dirname($targetAbs);
+                        if (!is_dir($parent)) {
+                            try {
+                                if (!mkdir($parent, 0750, true)) {
+                                    throw new ZipOpException('mkdir parent failed', 403, 'Cannot create destination folder.', ZipErrorCode::IO, $relPath);
+                                }
+                            } catch (ErrorException $e) {
+                                throw new ZipOpException('mkdir parent failed: ' . $e->getMessage(), 403, 'Cannot create destination folder.', ZipErrorCode::IO, $relPath);
+                            }
+                        }
+
+                        if (file_exists($targetAbs)) {
+                            throw new ZipOpException('Destination exists', 409, 'Destination already exists. Extract to an empty folder.', ZipErrorCode::DEST_EXISTS, $relPath);
+                        }
+
+                        $in = $zip->getStream($zipName);
+                        if ($in === false) {
+                            $detail = method_exists($zip, 'getStatusString') ? (string)$zip->getStatusString() : null;
+                            if ($password === '') {
+                                throw new ZipOpException('Entry stream failed', 400, 'ZIP is password-protected. Provide a password.', ZipErrorCode::PASSWORD_REQUIRED, $detail);
+                            }
+                            throw new ZipOpException('Entry stream failed', 400, 'Wrong ZIP password or corrupted ZIP.', ZipErrorCode::WRONG_PASSWORD, $detail);
+                        }
+
+                        $out = null;
+                        try {
+                            $out = fopen($targetAbs, 'xb');
+                            if ($out === false) {
+                                throw new ZipOpException('fopen failed', 403, 'Cannot write extracted file.', ZipErrorCode::IO, $relPath);
+                            }
+                            $bytes += $this->zipStreamCopy($in, $out, $startedAt);
+                        } finally {
+                            if (is_resource($in)) {
+                                fclose($in);
+                            }
+                            if (is_resource($out)) {
+                                fclose($out);
+                            }
+                        }
+
+                        if ($perms !== null) {
+                            try {
+                                chmod($targetAbs, $perms);
+                            } catch (Throwable) {
+                            }
+                        }
+                        if ($mtime > 0) {
+                            try {
+                                touch($targetAbs, $mtime);
+                            } catch (Throwable) {
+                            }
+                        }
+
+                        $files++;
+                        if ($recursive && str_ends_with(strtolower($relPath), '.zip')) {
+                            $zipCandidates[] = $targetAbs;
+                        }
+                    }
+
+                    $tick++;
+                    if ($tick % 20 === 0) {
+                        $this->zipWriteProgress($progressPath, [
+                            'state' => 'running',
+                            'op' => 'extract',
+                            'processed' => $tick,
+                            'total' => $numFiles,
+                            'bytes' => $bytes,
+                            'message' => 'Extracting…',
+                            'updated_at' => time(),
+                        ]);
+                    }
+                }
+            } finally {
+                $zip->close();
+            }
+
+            if ($recursive && count($zipCandidates) > 0) {
+                $nested = $this->zipExtractNested($zipCandidates, $destAbs, $password, $progressPath, $startedAt);
+            }
+
+            $destRelOut = $this->absToRelFromBase($destAbs);
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'done',
+                'op' => 'extract',
+                'processed' => $numFiles,
+                'total' => $numFiles,
+                'bytes' => $bytes,
+                'message' => 'Done.',
+                'result' => ['extracted_to' => $destRelOut, 'files' => $files, 'dirs' => $dirs, 'nested_zips' => $nested],
+                'updated_at' => time(),
+            ]);
+
+            return [
+                'progress_id' => $progressId,
+                'extracted_to' => $destRelOut,
+                'files' => $files,
+                'dirs' => $dirs,
+                'nested_zips' => $nested,
+            ];
+        } catch (ZipOpException $e) {
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'error',
+                'op' => 'extract',
+                'message' => $e->publicMessage ?? 'ZIP operation failed.',
+                'error_code' => $e->errorCode,
+                'detail' => $e->detail,
+                'updated_at' => time(),
+            ]);
+            throw $e;
+        } catch (Throwable $e) {
+            $this->zipWriteProgress($progressPath, [
+                'state' => 'error',
+                'op' => 'extract',
+                'message' => 'ZIP operation failed.',
+                'updated_at' => time(),
+            ]);
+            throw $e;
+        } finally {
+            $this->zipReleaseLocks($lockHandles);
+        }
+    }
+
+    /** @return array{state:string,op?:string,processed?:int,total?:int,bytes?:int,message?:string,result?:mixed,updated_at?:int} */
+    public function zipProgress(string $progressId): array
+    {
+        $progressId = $this->zipNormalizeProgressId($progressId);
+        $path = $this->zipProgressPath($progressId);
+        if (!file_exists($path)) {
+            return ['state' => 'missing'];
+        }
+
+        $fp = fopen($path, 'rb');
+        if ($fp === false) {
+            return ['state' => 'missing'];
+        }
+        try {
+            if (!flock($fp, LOCK_SH)) {
+                return ['state' => 'missing'];
+            }
+            $raw = stream_get_contents($fp);
+            if (!is_string($raw) || $raw === '') {
+                return ['state' => 'missing'];
+            }
+            $json = json_decode($raw, true);
+            if (!is_array($json)) {
+                return ['state' => 'missing'];
+            }
+            if (!isset($json['state']) || !is_string($json['state'])) {
+                $json['state'] = 'missing';
+            }
+            return $json;
+        } finally {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        }
+    }
+
+    private function zipNormalizeProgressId(?string $progressId): string
+    {
+        $id = is_string($progressId) ? trim($progressId) : '';
+        if ($id === '') {
+            $id = bin2hex(random_bytes(12));
+        }
+        $id = preg_replace('/[^A-Za-z0-9_\-]/', '', $id) ?? $id;
+        if ($id === '') {
+            $id = bin2hex(random_bytes(12));
+        }
+        return substr($id, 0, 64);
+    }
+
+    private function zipProgressPath(string $progressId): string
+    {
+        $sid = session_id();
+        if ($sid === '') {
+            $sid = 'nosess';
+        }
+        return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'tfm_zip_progress_' . $sid . '_' . $progressId . '.json';
+    }
+
+    /** @param array<string,mixed> $data */
+    private function zipWriteProgress(string $path, array $data): void
+    {
+        $fp = fopen($path, 'c+');
+        if ($fp === false) {
+            return;
+        }
+        try {
+            if (!flock($fp, LOCK_EX)) {
+                return;
+            }
+            $payload = json_encode($data, flags: JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (!is_string($payload)) {
+                return;
+            }
+            ftruncate($fp, 0);
+            rewind($fp);
+            fwrite($fp, $payload);
+            fflush($fp);
+        } catch (Throwable) {
+        } finally {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        }
+    }
+
+    /** @param array<int,string> $absPaths @return array<int, resource> */
+    private function zipAcquireLocks(array $absPaths, int $waitMs): array
+    {
+        $lockPaths = [];
+        foreach ($absPaths as $p) {
+            $p = trim($p);
+            if ($p === '') {
+                continue;
+            }
+            $dir = is_dir($p) ? $p : dirname($p);
+            $lock = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '.tfm_zip_lock_' . sha1($p) . '.lock';
+            $this->assertWithinBase($lock);
+            $lockPaths[] = $lock;
+        }
+        sort($lockPaths, SORT_STRING);
+
+        $handles = [];
+        $start = (int)floor(microtime(true) * 1000);
+        foreach ($lockPaths as $lp) {
+            $fp = fopen($lp, 'c+');
+            if ($fp === false) {
+                $this->zipReleaseLocks($handles);
+                throw new ZipOpException('Lock open failed', 500, 'Server cannot lock ZIP operation.', ZipErrorCode::IO);
+            }
+            $locked = false;
+            while (true) {
+                if (flock($fp, LOCK_EX | LOCK_NB)) {
+                    $locked = true;
+                    break;
+                }
+                $now = (int)floor(microtime(true) * 1000);
+                if (($now - $start) > $waitMs) {
+                    fclose($fp);
+                    $this->zipReleaseLocks($handles);
+                    throw new ZipOpException('Lock timeout', 423, 'ZIP file is busy. Try again.', ZipErrorCode::LOCK_TIMEOUT);
+                }
+                usleep(100000);
+            }
+            if ($locked) {
+                $handles[] = $fp;
+            } else {
+                fclose($fp);
+            }
+        }
+        return $handles;
+    }
+
+    /** @param array<int, resource> $handles */
+    private function zipReleaseLocks(array $handles): void
+    {
+        foreach ($handles as $h) {
+            if (is_resource($h)) {
+                try {
+                    flock($h, LOCK_UN);
+                } catch (Throwable) {
+                }
+                try {
+                    fclose($h);
+                } catch (Throwable) {
+                }
+            }
+        }
+    }
+
+    private function zipExtendTimeLimit(): void
+    {
+        try {
+            set_time_limit(30);
+        } catch (Throwable) {
+        }
+    }
+
+    private function zipCheckTimeout(float $startedAt): void
+    {
+        if ((microtime(true) - $startedAt) > self::ZIP_MAX_SECONDS) {
+            throw new ZipOpException('ZIP timeout', 408, 'ZIP operation timed out.', ZipErrorCode::TIMEOUT);
+        }
+    }
+
+    private function relToZipPath(string $rel): string
+    {
+        $p = str_replace('\\', '/', $rel);
+        $p = trim($p, '/');
+        return $p === '' ? '' : $p;
+    }
+
+    /** @return array{path:string,is_dir:bool} */
+    private function zipNormalizeEntryName(string $name): array
+    {
+        $n = str_replace('\\', '/', $name);
+        $n = ltrim($n, '/');
+        if ($n === '' || str_contains($n, "\0") || preg_match('/[\x00-\x1F\x7F]/', $n) === 1) {
+            throw new ZipOpException('Invalid entry name', 400, 'Invalid ZIP file entry name.', ZipErrorCode::INVALID_ZIP);
+        }
+        if (preg_match('/^[A-Za-z]:\//', $n) === 1 || str_starts_with($n, '//')) {
+            throw new ZipOpException('Absolute entry blocked', 400, 'ZIP contains unsafe paths.', ZipErrorCode::TRAVERSAL, $n);
+        }
+
+        $isDir = str_ends_with($n, '/');
+        $n = rtrim($n, '/');
+        $parts = array_values(array_filter(explode('/', $n), static fn (string $p): bool => $p !== '' && $p !== '.'));
+        foreach ($parts as $p) {
+            if ($p === '..') {
+                throw new ZipOpException('Traversal blocked', 400, 'ZIP contains unsafe paths.', ZipErrorCode::TRAVERSAL, $name);
+            }
+        }
+        $safe = implode('/', $parts);
+        if ($safe === '') {
+            $safe = '_';
+        }
+        return ['path' => $safe . ($isDir ? '/' : ''), 'is_dir' => $isDir];
+    }
+
+    private function zipOpenErrorDetail(int|bool $openResult): ?string
+    {
+        $code = is_int($openResult) ? $openResult : null;
+        if ($code === null) {
+            return null;
+        }
+        $map = [
+            ZipArchive::ER_EXISTS => 'File already exists.',
+            ZipArchive::ER_INCONS => 'Zip archive inconsistent.',
+            ZipArchive::ER_INVAL => 'Invalid argument.',
+            ZipArchive::ER_MEMORY => 'Malloc failure.',
+            ZipArchive::ER_NOENT => 'No such file.',
+            ZipArchive::ER_NOZIP => 'Not a zip archive.',
+            ZipArchive::ER_OPEN => 'Cannot open file.',
+            ZipArchive::ER_READ => 'Read error.',
+            ZipArchive::ER_SEEK => 'Seek error.',
+        ];
+        return $map[$code] ?? ('Zip error: ' . $code);
+    }
+
+    private function zipEntryPerms(ZipArchive $zip, int $index, bool $isDir): ?int
+    {
+        if (!method_exists($zip, 'getExternalAttributesIndex')) {
+            return $isDir ? 0750 : 0640;
+        }
+        $opsys = 0;
+        $attr = 0;
+        $ok = $zip->getExternalAttributesIndex($index, $opsys, $attr);
+        if ($ok !== true) {
+            return $isDir ? 0750 : 0640;
+        }
+        $mode = ($attr >> 16) & 0xFFFF;
+        $perms = $mode & 0777;
+        if ($perms <= 0) {
+            return $isDir ? 0750 : 0640;
+        }
+        return $perms;
+    }
+
+    private function zipStreamCopy(mixed $in, mixed $out, float $startedAt): int
+    {
+        $total = 0;
+        $chunk = 1024 * 1024;
+        while (!feof($in)) {
+            $this->zipExtendTimeLimit();
+            $this->zipCheckTimeout($startedAt);
+            $buf = fread($in, $chunk);
+            if ($buf === false) {
+                throw new ZipOpException('Read from zip failed', 400, 'Corrupted or incomplete ZIP file.', ZipErrorCode::CORRUPT);
+            }
+            if ($buf === '') {
+                break;
+            }
+            $len = strlen($buf);
+            $written = 0;
+            while ($written < $len) {
+                $n = fwrite($out, substr($buf, $written));
+                if ($n === false || $n === 0) {
+                    throw new ZipOpException('Write failed', 403, 'Cannot write extracted file.', ZipErrorCode::IO);
+                }
+                $written += $n;
+            }
+            $total += $len;
+            if ($total > (3 * 1024 * 1024 * 1024)) {
+                throw new ZipOpException('Zip entry too large', 400, 'ZIP entry is too large.', ZipErrorCode::TOO_LARGE);
+            }
+        }
+        return $total;
+    }
+
+    /** @param array<int,string> $zipAbsList */
+    private function zipExtractNested(array $zipAbsList, string $destRootAbs, string $password, string $progressPath, float $startedAt): int
+    {
+        $queue = [];
+        $seen = [];
+        foreach ($zipAbsList as $p) {
+            $rp = realpath($p);
+            if ($rp === false) {
+                continue;
+            }
+            $seen[$rp] = true;
+            $queue[] = ['zip' => $rp, 'depth' => 1];
+        }
+
+        $count = 0;
+        while (count($queue) > 0) {
+            $item = array_shift($queue);
+            if (!is_array($item)) {
+                break;
+            }
+            $zipAbs = (string)($item['zip'] ?? '');
+            $depth = (int)($item['depth'] ?? 1);
+            if ($zipAbs === '' || $depth > 5) {
+                continue;
+            }
+            if ($count >= 25) {
+                break;
+            }
+            if (!is_file($zipAbs) || !is_readable($zipAbs)) {
+                continue;
+            }
+            $this->zipExtendTimeLimit();
+            $this->zipCheckTimeout($startedAt);
+            $this->assertWithinBase($zipAbs);
+            $dirAbs = realpath(dirname($zipAbs));
+            if ($dirAbs === false || !is_dir($dirAbs) || !is_writable($dirAbs)) {
+                continue;
+            }
+            $this->assertWithinBase($dirAbs);
+            if (!$this->isPathWithin($dirAbs, $destRootAbs)) {
+                continue;
+            }
+
+            $base = pathinfo($zipAbs, PATHINFO_FILENAME);
+            $base = $base !== '' ? $base : 'nested';
+            $dest = rtrim($dirAbs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $base;
+            $suffix = 0;
+            while (file_exists($dest) && $suffix < 100) {
+                $suffix++;
+                $dest = rtrim($dirAbs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $base . '-' . $suffix;
+            }
+            if (file_exists($dest)) {
+                continue;
+            }
+
+            try {
+                if (!mkdir($dest, 0750, true)) {
+                    continue;
+                }
+            } catch (Throwable) {
+                continue;
+            }
+
+            $lockHandles = $this->zipAcquireLocks([$zipAbs, $dest], waitMs: 12000);
+            try {
+                $zip = new ZipArchive();
+                $openResult = $zip->open($zipAbs);
+                if ($openResult !== true) {
+                    $zip->close();
+                    continue;
+                }
+                if ($password !== '') {
+                    $zip->setPassword($password);
+                }
+                $numFiles = $zip->numFiles;
+                if (!is_int($numFiles) || $numFiles < 0) {
+                    $zip->close();
+                    continue;
+                }
+
+                $this->zipWriteProgress($progressPath, [
+                    'state' => 'running',
+                    'op' => 'extract',
+                    'processed' => $numFiles,
+                    'total' => $numFiles,
+                    'bytes' => 0,
+                    'message' => 'Extracting nested ZIP…',
+                    'updated_at' => time(),
+                ]);
+
+                $localCandidates = [];
+                for ($i = 0; $i < $numFiles; $i++) {
+                    $this->zipExtendTimeLimit();
+                    $this->zipCheckTimeout($startedAt);
+                    $stat = $zip->statIndex($i, ZipArchive::FL_UNCHANGED);
+                    if (!is_array($stat)) {
+                        $zip->close();
+                        continue 2;
+                    }
+                    $name = $stat['name'] ?? null;
+                    if (!is_string($name) || $name === '') {
+                        $zip->close();
+                        continue 2;
+                    }
+                    $norm = $this->zipNormalizeEntryName($name);
+                    $relPath = $norm['path'];
+                    $isDir = $norm['is_dir'];
+                    $mtime = (int)($stat['mtime'] ?? 0);
+                    $targetAbs = $dest . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relPath);
+                    $this->assertWithinBase($targetAbs);
+
+                    $perms = $this->zipEntryPerms($zip, $i, $isDir);
+                    if ($isDir) {
+                        if (!is_dir($targetAbs)) {
+                            @mkdir($targetAbs, $perms ?? 0750, true);
+                        }
+                        if ($mtime > 0) {
+                            @touch($targetAbs, $mtime);
+                        }
+                        continue;
+                    }
+
+                    $parent = dirname($targetAbs);
+                    if (!is_dir($parent)) {
+                        @mkdir($parent, 0750, true);
+                    }
+                    if (file_exists($targetAbs)) {
+                        continue;
+                    }
+                    $in = $zip->getStream($name);
+                    if ($in === false) {
+                        if ($password === '') {
+                            $zip->close();
+                            continue 2;
+                        }
+                        $zip->close();
+                        continue 2;
+                    }
+                    $out = null;
+                    try {
+                        $out = fopen($targetAbs, 'xb');
+                        if ($out === false) {
+                            continue;
+                        }
+                        $this->zipStreamCopy($in, $out, $startedAt);
+                    } finally {
+                        if (is_resource($in)) {
+                            fclose($in);
+                        }
+                        if (is_resource($out)) {
+                            fclose($out);
+                        }
+                    }
+                    if ($perms !== null) {
+                        @chmod($targetAbs, $perms);
+                    }
+                    if ($mtime > 0) {
+                        @touch($targetAbs, $mtime);
+                    }
+                    if (str_ends_with(strtolower($relPath), '.zip')) {
+                        $localCandidates[] = $targetAbs;
+                    }
+                }
+                $zip->close();
+
+                foreach ($localCandidates as $c) {
+                    $rp = realpath($c);
+                    if ($rp === false) {
+                        continue;
+                    }
+                    if (isset($seen[$rp])) {
+                        continue;
+                    }
+                    $seen[$rp] = true;
+                    $queue[] = ['zip' => $rp, 'depth' => $depth + 1];
+                }
+            } catch (Throwable) {
+            } finally {
+                $this->zipReleaseLocks($lockHandles);
+            }
+
+            $count++;
+        }
+
+        return $count;
+    }
 }
 
 final class Actions
@@ -1693,8 +2689,6 @@ final class Actions
     public function login(): array
     {
         $password = $this->readPostString('password', maxLen: 256, allowEmpty: true, trim: true);
-
-        debugLogError('[Actions::login] login password: ' . $password, 'INFO');  // DEBUG
 
         if ($password === '') {
             throw new AppException('Empty password', httpStatus: 400, publicMessage: 'Password is required.');
@@ -1846,6 +2840,53 @@ final class Actions
 
     #[RequiresAuth]
     #[RequiresCsrf]
+    #[RateLimited(key: 'zipCreate', limit: 10, windowSeconds: 60)]
+    public function zipCreate(): array
+    {
+        $src = $this->readPostString('src', maxLen: 4096);
+        $dst = $this->readPostString('dst', maxLen: 4096, allowEmpty: true);
+        $level = $this->readPostString('level', maxLen: 16, allowEmpty: true);
+        $progressId = $this->readPostString('progress_id', maxLen: 128, allowEmpty: true);
+
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+
+        $result = $this->fs->zipCreate($src, $dst, $level, $progressId !== '' ? $progressId : null);
+        return ['ok' => true, 'data' => $result];
+    }
+
+    #[RequiresAuth]
+    #[RequiresCsrf]
+    #[RateLimited(key: 'zipExtract', limit: 10, windowSeconds: 60)]
+    public function zipExtract(): array
+    {
+        $zip = $this->readPostString('zip', maxLen: 4096);
+        $dest = $this->readPostString('dest', maxLen: 2048, allowEmpty: true);
+        $password = $this->readPostString('password', maxLen: 256, allowEmpty: true, trim: false);
+        $recursive = $this->readPostString('recursive', maxLen: 8, allowEmpty: true);
+        $progressId = $this->readPostString('progress_id', maxLen: 128, allowEmpty: true);
+
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+
+        $result = $this->fs->zipExtract($zip, $dest, $password, $recursive === '1', $progressId !== '' ? $progressId : null);
+        return ['ok' => true, 'data' => $result];
+    }
+
+    #[RequiresAuth]
+    #[RequiresCsrf]
+    #[RateLimited(key: 'zipProgress', limit: 120, windowSeconds: 60)]
+    public function zipProgress(): array
+    {
+        $progressId = $this->readPostString('progress_id', maxLen: 128);
+        $data = $this->fs->zipProgress($progressId);
+        return ['ok' => true, 'data' => $data];
+    }
+
+    #[RequiresAuth]
+    #[RequiresCsrf]
     #[RateLimited(key: 'pw', limit: 6, windowSeconds: 600)]
     public function changePassword(): array
     {
@@ -1923,7 +2964,7 @@ final class App
     {
         $this->note = new NoteStore(self::NOTE_FILE);
         $this->security = new Security($this->note, self::IDLE_TIMEOUT_SECONDS);
-        $this->fs = new FsService(self::BASE_DIR, ['tfm.php', 'note.dat']);
+        $this->fs = new FsService(self::BASE_DIR, [basename(__FILE__), 'note.dat']);
         $this->actions = new Actions($this->security, $this->fs);
     }
 
@@ -1981,6 +3022,9 @@ final class App
                 'copy' => 'copy',
                 'delete' => 'delete',
                 'chmod' => 'chmod',
+                'zipCreate' => 'zipCreate',
+                'zipExtract' => 'zipExtract',
+                'zipProgress' => 'zipProgress',
                 'changePassword' => 'changePassword',
                 'download' => 'download',
                 default => '',
@@ -2026,12 +3070,20 @@ final class App
             $msg = (property_exists($e, 'publicMessage') && is_string($e->publicMessage) && $e->publicMessage !== '')
                 ? $e->publicMessage
                 : 'Request failed.';
+
+            $meta = [
+                'locked' => $lockMeta,
+            ];
+            if (property_exists($e, 'errorCode') && is_int($e->errorCode)) {
+                $meta['code'] = $e->errorCode;
+            }
+            if (property_exists($e, 'detail') && is_string($e->detail) && $e->detail !== '') {
+                $meta['detail'] = $e->detail;
+            }
             $this->sendJson([
                 'ok' => false,
                 'error' => $msg,
-                'meta' => [
-                    'locked' => $lockMeta,
-                ],
+                'meta' => $meta,
             ], $status);
         } catch (Throwable $e) {
             if (DEBUG_MODE) {
@@ -2548,6 +3600,145 @@ final class App
             return { wrap, input: i };
           }
 
+          function selectRow(label, options, value){
+            const wrap = document.createElement('div');
+            const l = document.createElement('div');
+            l.className = 'label';
+            l.textContent = label;
+            const s = document.createElement('select');
+            s.className = 'input';
+            (options||[]).forEach((opt) => {
+              const o = document.createElement('option');
+              o.value = String(opt && opt.value !== undefined ? opt.value : '');
+              o.textContent = String(opt && opt.label !== undefined ? opt.label : '');
+              s.appendChild(o);
+            });
+            if(value !== undefined && value !== null){
+              s.value = String(value);
+            }
+            wrap.appendChild(l);
+            wrap.appendChild(s);
+            return { wrap, select: s };
+          }
+
+          function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
+
+          async function runZipOperation(title, action, payload, doneTitle, doneMsg){
+            const progressId = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
+            const status = document.createElement('div');
+            status.className = 'help';
+            status.textContent = 'Starting…';
+            const barWrap = document.createElement('div');
+            barWrap.className = 'progressWrap';
+            const bar = document.createElement('div');
+            bar.className = 'progressBar';
+            bar.style.width = '0%';
+            barWrap.appendChild(bar);
+            const cancel = actionBtn('Close','',() => hideModal());
+            showModal(title,[status,barWrap],[cancel]);
+
+            const started = api(action,'POST', Object.assign({}, payload, { progress_id: progressId }));
+
+            try{
+              let lastState = '';
+              while(true){
+                const p = await api('zipProgress','POST',{ progress_id: progressId });
+                const state = (p && typeof p.state === 'string') ? p.state : 'missing';
+                const msg = (p && typeof p.message === 'string') ? p.message : '';
+                const processed = (p && typeof p.processed === 'number') ? p.processed : 0;
+                const total = (p && typeof p.total === 'number') ? p.total : 0;
+                if(state !== lastState || msg){
+                  status.textContent = msg || (state === 'running' ? 'Working…' : state);
+                  lastState = state;
+                }
+                if(total > 0){
+                  const pct = Math.max(0, Math.min(100, Math.floor((processed / total) * 100)));
+                  bar.style.width = pct + '%';
+                }
+                if(state === 'done'){
+                  break;
+                }
+                if(state === 'error'){
+                  throw new Error(msg || 'ZIP operation failed.');
+                }
+                await sleep(350);
+              }
+              const result = await started;
+              hideModal();
+              toast('ok', doneTitle, doneMsg);
+              const loadRes = await load();
+              if(loadRes && loadRes.ok !== true && loadRes.canceled !== true){
+                toast('err','Error', loadRes.error || 'Cannot load folder.');
+              }
+              return result;
+            }catch(err){
+              try{ await started; }catch(_e){}
+              throw err;
+            }
+          }
+
+          function zipCreateModal(srcPath, name){
+            const dstRow = inputRow('Destination .zip (relative, optional)','text','');
+            const levelRow = selectRow('Compression level', [
+              { value: 'fast', label: 'Fast' },
+              { value: 'normal', label: 'Normal' },
+              { value: 'maximum', label: 'Maximum' },
+            ], 'normal');
+            const help = document.createElement('div');
+            help.className = 'help';
+            help.textContent = 'Create a .zip archive. Leave destination blank to create next to the source item.';
+            const cancel = actionBtn('Cancel','',() => hideModal());
+            const ok = actionBtn('Create ZIP','primary', async () => {
+              ok.disabled = true;
+              try{
+                const dst = String(dstRow.input.value || '').trim();
+                const level = String(levelRow.select.value || '').trim();
+                hideModal();
+                await runZipOperation('Creating ZIP…', 'zipCreate', { src: srcPath, dst, level }, 'Created', 'ZIP created.');
+              }catch(err){
+                toast('err','Error', String(err.message||'ZIP create failed.'));
+              }finally{
+                ok.disabled = false;
+              }
+            });
+            showModal('Create ZIP: ' + name,[dstRow.wrap, levelRow.wrap, help],[cancel, ok]);
+            dstRow.input.focus();
+          }
+
+          function zipExtractModal(zipPath, name){
+            const destRow = inputRow('Destination folder (relative, optional)','text','');
+            const pwRow = inputRow('Password (optional)','password','');
+            const recWrap = document.createElement('div');
+            const recLabel = document.createElement('label');
+            recLabel.className = 'help';
+            const rec = document.createElement('input');
+            rec.type = 'checkbox';
+            rec.style.marginRight = '8px';
+            recLabel.appendChild(rec);
+            recLabel.appendChild(document.createTextNode('Extract nested ZIPs (recursive)'));
+            recWrap.appendChild(recLabel);
+            const help = document.createElement('div');
+            help.className = 'help';
+            help.textContent = 'Extract this .zip archive. Leave destination blank to extract into the ZIP’s parent folder.';
+            const cancel = actionBtn('Cancel','',() => hideModal());
+            const ok = actionBtn('Extract','primary', async () => {
+              ok.disabled = true;
+              try{
+                const dest = String(destRow.input.value || '').trim();
+                const password = String(pwRow.input.value || '');
+                const recursive = rec.checked ? '1' : '0';
+                hideModal();
+                await runZipOperation('Extracting ZIP…', 'zipExtract', { zip: zipPath, dest, password, recursive }, 'Extracted', 'ZIP extracted.');
+              }catch(err){
+                toast('err','Error', String(err.message||'ZIP extract failed.'));
+              }finally{
+                ok.disabled = false;
+              }
+            });
+            showModal('Extract ZIP: ' + name,[destRow.wrap, pwRow.wrap, recWrap, help],[cancel, ok]);
+            destRow.input.focus();
+          }
+
           async function load(){
             if(!tbody) return { ok:false, canceled:false, error:'Cannot load folder.' };
             const seq = ++loadSeq;
@@ -2615,8 +3806,15 @@ final class App
               actions.className = 'rowActions';
               if(e.type === 'dir'){
                 actions.appendChild(actionBtn('Open','',() => navigate(joinPath(currentDir, e.name))));
+                actions.appendChild(actionBtn('Zip','',() => zipCreateModal(joinPath(currentDir, e.name), e.name)));
               }else{
                 actions.appendChild(actionBtn('Download','',() => download(joinPath(currentDir, e.name))));
+                const isZip = String(e.name||'').toLowerCase().endsWith('.zip');
+                if(isZip){
+                  actions.appendChild(actionBtn('Extract','',() => zipExtractModal(joinPath(currentDir, e.name), e.name)));
+                }else{
+                  actions.appendChild(actionBtn('Zip','',() => zipCreateModal(joinPath(currentDir, e.name), e.name)));
+                }
               }
               actions.appendChild(actionBtn('Rename/Move','',() => renameMoveModal(joinPath(currentDir, e.name), e.name)));
               actions.appendChild(actionBtn('Copy','',() => copyModal(joinPath(currentDir, e.name), e.name)));
